@@ -11,6 +11,9 @@ from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, w
     o3d_knn, params2rendervar, params2cpu, save_params
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
 
+import wandb
+
+ROOT = "/mnt/share/nas/Projects/Espresso/Data/dynamic_3dgs"
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -18,9 +21,10 @@ def get_dataset(t, md, seq):
         w, h, k, w2c = md['w'], md['h'], md['k'][t][c], md['w2c'][t][c]
         cam = setup_camera(w, h, k, w2c, near=1.0, far=100)
         fn = md['fn'][t][c]
-        im = np.array(copy.deepcopy(Image.open(f"./data/{seq}/ims/{fn}")))
+        im = np.array(copy.deepcopy(Image.open(f"{ROOT}/input/{seq}/ims/{fn}")))
         im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
-        seg = np.array(copy.deepcopy(Image.open(f"./data/{seq}/seg/{fn.replace('.jpg', '.png')}"))).astype(np.float32)
+        seg = np.array(copy.deepcopy(Image.open(f"{ROOT}/input/{seq}/seg/{fn.replace('.jpg', '.png')}"))).astype(np.float32)/255
+        # print(np.max(seg))
         seg = torch.tensor(seg).float().cuda()
         seg_col = torch.stack((seg, torch.zeros_like(seg), 1 - seg))
         dataset.append({'cam': cam, 'im': im, 'seg': seg_col, 'id': c})
@@ -35,7 +39,10 @@ def get_batch(todo_dataset, dataset):
 
 
 def initialize_params(seq, md):
-    init_pt_cld = np.load(f"./data/{seq}/init_pt_cld.npz")["data"]
+    init_pt_cld = np.load(f"{ROOT}/input/{seq}/init_pt_cld.npz")["data"]
+    # for k in init_pt_cld.keys():
+    #     print(k)
+    # exit(1)
     seg = init_pt_cld[:, 6]
     max_cams = 50
     sq_dist, _ = o3d_knn(init_pt_cld[:, :3], 3)
@@ -94,7 +101,10 @@ def get_loss(params, curr_data, variables, is_initial_timestep):
 
     if not is_initial_timestep:
         is_fg = (params['seg_colors'][:, 0] > 0.5).detach()
+        # print(is_fg.shape)
         fg_pts = rendervar['means3D'][is_fg]
+        # print(fg_pts[:,1].shape)
+        # exit(1)
         fg_rot = rendervar['rotations'][is_fg]
 
         rel_rot = quat_mult(fg_rot, variables["prev_inv_rot_fg"])
@@ -111,13 +121,14 @@ def get_loss(params, curr_data, variables, is_initial_timestep):
         curr_offset_mag = torch.sqrt((curr_offset ** 2).sum(-1) + 1e-20)
         losses['iso'] = weighted_l2_loss_v1(curr_offset_mag, variables["neighbor_dist"], variables["neighbor_weight"])
 
-        losses['floor'] = torch.clamp(fg_pts[:, 1], min=0).mean()
+        losses['floor'] = torch.clamp(fg_pts[:, 1], max=0).mean()
 
         bg_pts = rendervar['means3D'][~is_fg]
         bg_rot = rendervar['rotations'][~is_fg]
         losses['bg'] = l1_loss_v2(bg_pts, variables["init_bg_pts"]) + l1_loss_v2(bg_rot, variables["init_bg_rot"])
 
         losses['soft_col_cons'] = l1_loss_v2(params['rgb_colors'], variables["prev_col"])
+    wandb.log(losses)
 
     loss_weights = {'im': 1.0, 'seg': 3.0, 'rigid': 4.0, 'rot': 4.0, 'iso': 2.0, 'floor': 2.0, 'bg': 20.0,
                     'soft_col_cons': 0.01}
@@ -185,11 +196,32 @@ def report_progress(params, data, i, progress_bar, every_i=100):
 
 
 def train(seq, exp):
-    if os.path.exists(f"./output/{exp}/{seq}"):
-        print(f"Experiment '{exp}' for sequence '{seq}' already exists. Exiting.")
+    if os.path.exists(f"{ROOT}/output/{seq}/{exp}"):
+        print(f"Experiment '{exp}' for sequence '{seq}' already exists at {ROOT}/output/{seq}/{exp}. Exiting.")
         return
-    md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))  # metadata
+    md = json.load(open(f"{ROOT}/input/{seq}/train_meta.json", 'r'))  # metadata
     num_timesteps = len(md['fn'])
+    # num_timesteps = 20
+    wandb.login()
+    wandb.require("core")
+    run = wandb.init(
+        # Set the project where this run will be logged
+        project="dynamic_3d_gaussians_debug",
+        # Track hyperparameters and run metadata
+        config={
+            "run_type": "explore",
+            "description": "clean data but generating more results to inspect pointclouds",
+            "name": f"{seq}/{exp}",
+            'im': 1.0, 
+            'seg': 3.0, 
+            'rigid': 4.0, 
+            'rot': 4.0, 
+            'iso': 2.0, 
+            'floor': 2.0, 
+            'bg': 20.0,
+            'soft_col_cons': 0.01
+        },
+    )
     params, variables = initialize_params(seq, md)
     optimizer = initialize_optimizer(params, variables)
     output_params = []
@@ -205,6 +237,7 @@ def train(seq, exp):
             curr_data = get_batch(todo_dataset, dataset)
             loss, variables = get_loss(params, curr_data, variables, is_initial_timestep)
             loss.backward()
+            wandb.log({'total_loss':loss})
             with torch.no_grad():
                 report_progress(params, dataset[0], i, progress_bar)
                 if is_initial_timestep:
@@ -215,11 +248,18 @@ def train(seq, exp):
         output_params.append(params2cpu(params, is_initial_timestep))
         if is_initial_timestep:
             variables = initialize_post_first_timestep(params, variables, optimizer)
-    save_params(output_params, seq, exp)
+    save_params(output_params, seq, exp, ROOT)
+    wandb.finish()
 
 
 if __name__ == "__main__":
-    exp_name = "exp1"
-    for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
-        train(sequence, exp_name)
-        torch.cuda.empty_cache()
+    # exp_name = "static_5"
+    exp_name = "exp_1"
+    # exp_name = "ref_trial"
+    # for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
+    #     train(sequence, exp_name)
+    #     torch.cuda.empty_cache()
+    # train("tennis", exp_name)
+    for sequence in [0, 1, 2, 3, 4]:
+        train(f"slide_block_to_target/episode_{sequence}", exp_name)
+    torch.cuda.empty_cache()
