@@ -233,6 +233,8 @@ def visualize(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "pretrained"
-    for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
-        visualize(sequence, exp_name)
+    # exp_name = "pretrained"
+    exp_name = "exp1"
+    # for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
+    #     visualize(sequence, exp_name)
+    visualize("slide_block_to_target", exp_name)

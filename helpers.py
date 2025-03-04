@@ -98,5 +98,5 @@ def save_params(output_params, seq, exp, root):
             to_save[k] = np.stack([params[k] for params in output_params])
         else:
             to_save[k] = output_params[0][k]
-    os.makedirs(f"{root}/output/{seq}", exist_ok=True)
+    os.makedirs(f"{root}/output/{seq}/{exp}", exist_ok=True)
     np.savez(f"{root}/output/{seq}/{exp}/params", **to_save)
